@@ -34,3 +34,43 @@ body{ margin:0; background:var(--bg); font-family: system-ui, -apple-system, Seg
   width:9px; height:9px; background:#dc2626; border-radius:999px;
   margin-inline-start:6px; display:inline-block; box-shadow:0 0 0 2px #fff;
 }
+/* ====== Pro Layout for Irrigation ====== */
+.page { display:flex; flex-direction:column; gap:16px; }
+.ribbon { display:flex; justify-content:space-between; align-items:center; gap:12px; background:#f7fdf7; border:1px solid #e8f6e8; padding:10px 12px; border-radius:12px; }
+.chip{ display:flex; align-items:center; gap:8px; background:#eefbf0; padding:6px 10px; border-radius:999px; }
+.small{ font-size:12px; }
+.stack{ display:flex; flex-direction:column; gap:14px; }
+
+.card.pro{ border:1px solid #edf1ef; background:#fff; border-radius:14px; box-shadow:0 6px 18px rgba(0,0,0,.04); overflow:hidden; }
+.card-head{ width:100%; text-align:start; background:linear-gradient(180deg,#fafcfa,#f7fbf7); padding:12px 14px; border:none; display:flex; align-items:center; gap:8px; cursor:pointer; }
+.card-head h3{ margin:0; font-weight:700; font-size:16px; }
+.card-body{ padding:14px; display:flex; flex-direction:column; gap:12px; }
+.caret{ font-weight:700; color:#6abf69; }
+
+.grid2{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.grid3{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+@media (max-width:900px){ .grid2,.grid3{ grid-template-columns:1fr; } }
+
+.formrow{ display:flex; flex-direction:column; gap:6px; }
+.label{ font-size:12px; color:#5b5f64; }
+.input{ border:1px solid #e6e8ea; padding:10px 12px; border-radius:10px; outline:none; }
+.input:focus{ border-color:#7cc47a; box-shadow:0 0 0 3px rgba(124,196,122,.15); }
+.btn{ border:1px solid #dde2e0; background:#fff; padding:9px 12px; border-radius:10px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; }
+.btn:hover{ background:#f6faf6; }
+.btn.primary{ background:#1b9e5a; border-color:#1b9e5a; color:#fff; }
+.btn.ghost{ background:#f7faf7; }
+
+.hstack{ display:flex; gap:8px; align-items:center; }
+
+.pill{ border:1px solid #e6efe6; background:#f8fdfa; padding:12px; border-radius:12px; }
+.pill.muted{ color:#566; }
+
+.range input[type="range"]{ width:100%; }
+
+.table{ border:1px solid #edf2f0; border-radius:10px; overflow:hidden; }
+.thead,.trow{ display:grid; grid-template-columns: 1.5fr 1.5fr 1.4fr .8fr .8fr; gap:10px; }
+.thead{ background:#f6fbf7; padding:10px; font-weight:600; }
+.trow{ padding:10px; border-top:1px solid #f0f3f2; }
+.err{ color:#c62828; font-size:12px; }
+.switch{ display:flex; align-items:center; gap:8px; margin-top:6px; }
+.switch > span{ display:inline-flex; gap:6px; align-items:center; }

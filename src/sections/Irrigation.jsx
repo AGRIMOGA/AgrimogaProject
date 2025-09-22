@@ -1,336 +1,399 @@
-import { useEffect, useMemo, useState } from 'react'
-import { MapPin, Thermometer, Wind, Droplets, Locate, RefreshCw, Share2, Info } from 'lucide-react'
-import { loadJSON, saveJSON } from '@/lib/storage'
+import { useEffect, useMemo, useState } from "react"
+import { MapPin, Thermometer, Wind, Droplets, Bell, Share2, Locate, Cloud } from "lucide-react"
+import { loadJSON, saveJSON } from "@/lib/storage"
 
-/* =========================
-   التخزين + مفاتيح OpenWeather
-========================= */
-const LS_FORM = 'agrimoga:irrig:form'
-const LS_WX   = 'agrimoga:irrig:wx'
-const LS_LOG  = 'agrimoga:irrig:log' // سجل بسيط محلي
+// مفاتيح التخزين
+const LS_FORM = "agrimoga:waterForm:v2"
+const LS_LAST = "agrimoga:lastAdvice:v2"
 
-const OWM = {
-  key: import.meta.env.VITE_OWM_API_KEY,
-  forecast(lat, lon) {
-    return `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&lang=ar&appid=${this.key}`
-  },
-  revGeo(lat, lon) {
-    return `https://api.openweathermap.org/geo/1.0/reverse?lat=${lat}&lon=${lon}&limit=1&appid=${this.key}`
-  },
+// API مفتاح OpenWeather (من Vite env)
+const OWM_KEY = import.meta.env.VITE_OWM_API_KEY
+
+// --- Helpers صغيرة
+async function geocodeCity(name) {
+  const u = `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(name)}&limit=1&appid=${OWM_KEY}`
+  const r = await fetch(u)
+  if (!r.ok) throw new Error("geo failed")
+  const j = await r.json()
+  if (!j?.length) throw new Error("not found")
+  return { lat: j[0].lat, lon: j[0].lon, label: j[0].name }
 }
-
-/* =========================
-   Helpers
-========================= */
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v))
-
-function summarizeForecast(forecastJson) {
-  const list = forecastJson?.list || []
+async function fetchForecast(lat, lon) {
+  const u = `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&lang=ar&appid=${OWM_KEY}`
+  const r = await fetch(u)
+  if (!r.ok) throw new Error("forecast failed")
+  return await r.json()
+}
+function summarize(forecast) {
+  const list = forecast?.list || []
   if (!list.length) return null
   const now = list[0]
-  const temp = Math.round(now.main?.temp ?? 22)
-  const wind = Math.round((now.wind?.speed ?? 3) * 3.6) // m/s → km/h
-  const humidity = clamp(Math.round(now.main?.humidity ?? 50), 0, 100)
-  const today = list.slice(0, 8)
-  const tomorrow = list.slice(8, 16)
-  const avg = arr => Math.round((arr.reduce((s, x) => s + (x.pop ?? 0), 0) / (arr.length || 1)) * 100)
-  const popToday = avg(today)
-  const popTomorrow = avg(tomorrow)
-  const rainyTomorrow = popTomorrow >= 30
-  return { temp, wind, humidity, popToday, rainyTomorrow }
+  const temp = Math.round(now.main.temp)
+  const wind = Math.round(now.wind.speed * 3.6)
+  const popToday = Math.round(
+    (list.slice(0, 8).reduce((s, it) => s + (it.pop || 0), 0) / Math.min(8, list.length)) * 100
+  )
+  const popTomorrow = Math.round(
+    (list.slice(8, 16).reduce((s, it) => s + (it.pop || 0), 0) / Math.max(1, Math.min(8, Math.max(0, list.length - 8)))) * 100
+  )
+  return { temp, wind, rain: popToday, rainyTomorrow: popTomorrow >= 30 }
 }
 
-function irrigationAdvice({ crop, area, temp, humidity, wind, rainyTomorrow, pumpFlowLh, emittersPerM2, emitterFlowLh }) {
-  const basePer100m2 = crop === 'avocat' ? 400 : crop === 'framboise' ? 280 : 250
-  let litersPer100m2 = basePer100m2
-  if (temp >= 35) litersPer100m2 *= 1.4
-  else if (temp >= 30) litersPer100m2 *= 1.2
-  else if (temp <= 10) litersPer100m2 *= 0.8
-  if (wind >= 35) litersPer100m2 *= 1.15
-  if (humidity >= 75) litersPer100m2 *= 0.9
-  if (rainyTomorrow && humidity >= 60) litersPer100m2 *= 0.6
+// حساب التوصية
+function getAdvice({ crop, areaM2, emittersPerM2, emitterLph, temp, wind, rain, rainyTomorrow }) {
+  // أساس حسب المحصول للمتر المربع (لتر/م²/يوم)
+  const basePerM2 = { fraise: 2.5, framboise: 2.8, avocat: 4.0 }[crop] ?? 2.5
+  let need = basePerM2
 
-  const liters = Math.max(0, Math.round((litersPer100m2 / 100) * area))
-  const totalNetworkLh =
-    Number(pumpFlowLh) > 0
-      ? Number(pumpFlowLh)
-      : Math.max(1, Math.round((emittersPerM2 * emitterFlowLh) * (area / 1)))
-  const hours = liters / Math.max(totalNetworkLh, 1)
-  const minutes = Math.max(1, Math.round(hours * 60))
+  if (temp >= 35) need *= 1.4
+  else if (temp >= 30) need *= 1.2
+  else if (temp <= 10) need *= 0.8
+
+  if (wind >= 40) need *= 1.15
+  if (rain >= 60) need *= 0.3
+  else if (rain >= 30) need *= 0.6
+
+  const liters = Math.max(0, Math.round(need * areaM2))
+  const totalEmitterFlowLph = emittersPerM2 * areaM2 * emitterLph
+  const minutes = totalEmitterFlowLph > 0 ? Math.round((liters / totalEmitterFlowLph) * 60) : 0
+
+  const postpone =
+    rainyTomorrow && rain < 20 && liters > 0 ? { title: "أجّل السقي اليوم", reason: "غداً متوقع المطر" } : null
+  const decision =
+    postpone ||
+    (liters === 0
+      ? { title: "ما تسقّيش اليوم", reason: "الاحتياج ضعيف بسبب المطر/الطقس" }
+      : { title: "سقي عادي", reason: "ظروف متوسطة" })
+
   const tip =
-    liters <= 120 ? '💡 سقي خفيف ومتكرر.'
-    : rainyTomorrow ? '💡 متوقع المطر غداً — نقص شوية اليوم.'
-    : '💡 راقب التربة، ما تغمّرش بزاف.'
-  return { liters, minutes, tip }
+    crop === "avocat"
+      ? "سقي عميق وبعيد بين الدورات."
+      : crop === "framboise"
+      ? "حافظ على صرف جيد وتحكم فالتربة."
+      : "سقي خفيف ومتكرر لتجنّب تعفن الجذور."
+
+  return { liters, minutes, decision, tip }
 }
 
-/* =========================
-   UI helpers (تصميم عمودي أنيق)
-========================= */
-function Section({ title, hint, children }) {
-  return (
-    <div className="card" style={{ marginBottom: 12 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
-        <h3 style={{ margin: 0 }}>{title}</h3>
-        {hint && <span className="muted" style={{ fontSize: 12 }}>{hint}</span>}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function Row({ label, children }) {
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 10, alignItems: 'center', marginBottom: 8 }}>
-      <label className="label" style={{ margin: 0 }}>{label}</label>
-      <div>{children}</div>
-    </div>
-  )
-}
-
-/* =========================
-   Component
-========================= */
 export default function Irrigation() {
-  // الحقول الأساسية
-  const init = loadJSON(LS_FORM, {
-    crop: 'fraise',
-    area: 100,
-    zone: 'Zone A — 100 m²',
-    pumpFlowLh: 0,
-    emittersPerM2: 4,
-    emitterFlowLh: 2,
-    useGPS: true,
-    placeName: '',
+  // حالة النموذج
+  const s0 = loadJSON(LS_FORM, {
+    crop: "fraise",                // المحصول
+    zoneName: "Zone A — 100 m²",   // اسم/وصف قطعة
+    areaM2: 100,                   // المساحة
+    emittersPerM2: 4,              // عدد النقاط/م²
+    emitterLph: 2,                 // صبيب النقطة (ل/ساعة)
+    placeQuery: "",                // إدخال المستخدم
+    autoGPS: true,                 // تفعيل GPS تلقائي
+    lastPlace: "",                 // المكان الأخير
   })
-  const [crop, setCrop] = useState(init.crop)
-  const [area, setArea] = useState(init.area)
-  const [zone, setZone] = useState(init.zone)
-  const [pumpFlowLh, setPumpFlowLh] = useState(init.pumpFlowLh)
-  const [emittersPerM2, setEmittersPerM2] = useState(init.emittersPerM2)
-  const [emitterFlowLh, setEmitterFlowLh] = useState(init.emitterFlowLh)
-  const [useGPS, setUseGPS] = useState(init.useGPS)
-  const [placeName, setPlaceName] = useState(init.placeName)
+  const [crop, setCrop] = useState(s0.crop)
+  const [zoneName, setZoneName] = useState(s0.zoneName)
+  const [areaM2, setAreaM2] = useState(s0.areaM2)
+  const [emittersPerM2, setEmittersPerM2] = useState(s0.emittersPerM2)
+  const [emitterLph, setEmitterLph] = useState(s0.emitterLph)
 
-  // الطقس
-  const wx0 = loadJSON(LS_WX, { temp: 24, humidity: 50, wind: 10, rainyTomorrow: false, popToday: 0 })
-  const [temp, setTemp] = useState(wx0.temp)
-  const [humidity, setHumidity] = useState(wx0.humidity)
-  const [wind, setWind] = useState(wx0.wind)
-  const [rainyTomorrow, setRainyTomorrow] = useState(wx0.rainyTomorrow)
-  const [loading, setLoading] = useState(false)
-  const [err, setErr] = useState('')
+  const [placeQuery, setPlaceQuery] = useState(s0.placeQuery)
+  const [autoGPS, setAutoGPS] = useState(s0.autoGPS)
+  const [resolvedPlace, setResolvedPlace] = useState(s0.lastPlace)
 
-  // سجل بسيط
-  const [log, setLog] = useState(loadJSON(LS_LOG, []))
+  const [temp, setTemp] = useState(20)
+  const [rain, setRain] = useState(10)
+  const [wind, setWind] = useState(5)
+  const [rainyTomorrow, setRainyTomorrow] = useState(false)
 
+  const [loadingWx, setLoadingWx] = useState(false)
+  const [err, setErr] = useState("")
+  const [open, setOpen] = useState({ quick: true, field: true, weather: true, summary: true, history: false })
+
+  // حافظ كل تغيير
   useEffect(() => {
-    saveJSON(LS_FORM, { crop, area, zone, pumpFlowLh, emittersPerM2, emitterFlowLh, useGPS, placeName })
-  }, [crop, area, zone, pumpFlowLh, emittersPerM2, emitterFlowLh, useGPS, placeName])
+    saveJSON(LS_FORM, {
+      crop,
+      zoneName,
+      areaM2,
+      emittersPerM2,
+      emitterLph,
+      placeQuery,
+      autoGPS,
+      lastPlace: resolvedPlace,
+    })
+  }, [crop, zoneName, areaM2, emittersPerM2, emitterLph, placeQuery, autoGPS, resolvedPlace])
 
+  // GPS تلقائي
   useEffect(() => {
-    saveJSON(LS_WX, { temp, humidity, wind, rainyTomorrow, popToday: wx0.popToday })
-  }, [temp, humidity, wind, rainyTomorrow])
-
-  /* جلب الطقس */
-  async function fetchWeatherByCoords(lat, lon) {
-    setErr('')
-    setLoading(true)
-    try {
-      if (!OWM.key) throw new Error('أضف VITE_OWM_API_KEY إلى .env.local وإلى Vercel.')
-      const fr = await fetch(OWM.forecast(lat, lon))
-      if (!fr.ok) throw new Error('تعذر جلب Forecast من OpenWeather')
-      const forecast = await fr.json()
-      const sum = summarizeForecast(forecast)
-      if (!sum) throw new Error('Forecast فارغ')
-      let place = placeName
-      try {
-        const rp = await fetch(OWM.revGeo(lat, lon))
-        const arr = await rp.json()
-        if (Array.isArray(arr) && arr[0]) {
-          const el = arr[0]
-          place = el.local_names?.ar || el.name || `${lat.toFixed(3)},${lon.toFixed(3)}`
+    if (!autoGPS || !OWM_KEY) return
+    setErr("")
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        try {
+          setLoadingWx(true)
+          const { latitude: lat, longitude: lon } = pos.coords
+          const f = await fetchForecast(lat, lon)
+          const s = summarize(f)
+          if (!s) throw new Error("no summary")
+          setTemp(s.temp)
+          setWind(s.wind)
+          setRain(s.rain)
+          setRainyTomorrow(s.rainyTomorrow)
+          setResolvedPlace(f?.city?.name || "GPS")
+        } catch (e) {
+          setErr("تعذّر جلب الطقس عبر GPS")
+        } finally {
+          setLoadingWx(false)
         }
-      } catch {}
-      setTemp(sum.temp); setWind(sum.wind); setHumidity(sum.humidity); setRainyTomorrow(sum.rainyTomorrow); setPlaceName(place || '')
+      },
+      () => setErr("خاص ترخيص GPS من المتصفح")
+    )
+  }, [autoGPS])
+
+  async function handleCityFetch() {
+    if (!placeQuery.trim() || !OWM_KEY) return
+    setErr("")
+    try {
+      setLoadingWx(true)
+      const { lat, lon, label } = await geocodeCity(placeQuery.trim())
+      const f = await fetchForecast(lat, lon)
+      const s = summarize(f)
+      if (!s) throw new Error("no summary")
+      setTemp(s.temp)
+      setWind(s.wind)
+      setRain(s.rain)
+      setRainyTomorrow(s.rainyTomorrow)
+      setResolvedPlace(label)
     } catch (e) {
-      setErr(e.message || 'وقع خطأ أثناء جلب الطقس')
+      setErr("ما قدرناش نجيبو الطقس لهاد المكان")
     } finally {
-      setLoading(false)
+      setLoadingWx(false)
     }
   }
 
-  function useCurrentGPS() {
-    if (!navigator.geolocation) { setErr('المتصفح لا يدعم GPS'); return }
-    setErr(''); setLoading(true)
-    navigator.geolocation.getCurrentPosition(
-      pos => fetchWeatherByCoords(pos.coords.latitude, pos.coords.longitude),
-      () => { setErr('خاص ترخيص GPS'); setLoading(false) },
-      { enableHighAccuracy: true, timeout: 12000 }
-    )
-  }
-
-  useEffect(() => { if (useGPS) useCurrentGPS() }, [useGPS])
-
-  /* حساب التوصية */
   const advice = useMemo(
-    () => irrigationAdvice({
-      crop,
-      area: Number(area) || 0,
-      temp, humidity, wind, rainyTomorrow,
-      pumpFlowLh: Number(pumpFlowLh) || 0,
-      emittersPerM2: Number(emittersPerM2) || 0,
-      emitterFlowLh: Number(emitterFlowLh) || 0,
-    }),
-    [crop, area, temp, humidity, wind, rainyTomorrow, pumpFlowLh, emittersPerM2, emitterFlowLh]
+    () =>
+      getAdvice({
+        crop,
+        areaM2: +areaM2 || 0,
+        emittersPerM2: +emittersPerM2 || 0,
+        emitterLph: +emitterLph || 0,
+        temp,
+        wind,
+        rain,
+        rainyTomorrow,
+      }),
+    [crop, areaM2, emittersPerM2, emitterLph, temp, wind, rain, rainyTomorrow]
   )
 
-  /* حفظ في السجل */
-  function addToLog() {
-    const entry = {
-      at: new Date().toLocaleString(),
-      crop, area,
+  // مشاركة واتساب
+  function shareWhatsApp() {
+    const txt = `💧 توصية السقي
+• المحصول: ${crop === "fraise" ? "فراولة" : crop === "framboise" ? "فرامبواز" : "أفوكا"}
+• القطعة: ${zoneName}
+• المكان: ${resolvedPlace || "غير محدد"}
+• الطقس: حرارة ${temp}°C • ريح ${wind} كم/س • شتا ${rain}%
+• الكمية: ${advice.liters} لتر (≈ ${advice.minutes} دقيقة)
+(Agrimoga)`
+    window.open(`https://wa.me/?text=${encodeURIComponent(txt)}`, "_blank")
+  }
+
+  // حفظ Snapshot للتاريخ
+  function addHistoryNote() {
+    const prev = loadJSON(LS_LAST, [])
+    const row = {
+      at: Date.now(),
+      crop,
+      zoneName,
+      areaM2,
       liters: advice.liters,
       minutes: advice.minutes,
-      place: placeName || 'غير محدد',
-      wx: { temp, humidity, wind, rainyTomorrow }
+      place: resolvedPlace,
+      weather: { temp, wind, rain, rainyTomorrow },
     }
-    const next = [entry, ...log].slice(0, 50)
-    setLog(next)
-    saveJSON(LS_LOG, next)
+    const next = [row, ...prev].slice(0, 50)
+    saveJSON(LS_LAST, next)
+    setOpen((s) => ({ ...s, history: true }))
   }
 
+  const history = loadJSON(LS_LAST, [])
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {/* 1) الطقس */}
-      <Section title="الطقس" hint={placeName ? <><MapPin size={14}/> {placeName}</> : null}>
-        <Row label={<><Thermometer size={14}/> الحرارة</>}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <input type="range" min={-5} max={45} step={1} value={temp} onChange={e => setTemp(+e.target.value)} style={{ width: '100%' }} />
-            <b>{temp}°C</b>
-          </div>
-        </Row>
-        <Row label={<><Droplets size={14}/> الرطوبة / احتمال الشتا</>}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <input type="range" min={0} max={100} step={5} value={humidity} onChange={e => setHumidity(+e.target.value)} style={{ width: '100%' }} />
-            <b>{humidity}%</b>
-          </div>
-        </Row>
-        <Row label={<><Wind size={14}/> الريح</>}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <input type="range" min={0} max={80} step={5} value={wind} onChange={e => setWind(+e.target.value)} style={{ width: '100%' }} />
-            <b>{wind} كم/س</b>
-          </div>
-        </Row>
-        <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <button className="btn" onClick={useCurrentGPS} disabled={loading}>
-            <Locate size={16}/> {loading ? 'كيجيب الطقس…' : 'GPS الآن'}
-          </button>
-          <button className="btn" onClick={() => setUseGPS(v => !v)}>
-            <RefreshCw size={16}/> {useGPS ? 'تعطيل التحديث التلقائي' : 'تفعيل التحديث التلقائي'}
-          </button>
-          {err && <span style={{ color:'#dc2626', fontSize:12 }}>⚠️ {err}</span>}
+    <div className="page">
+      {/* شريط معلومات سريع */}
+      <section className="ribbon">
+        <div className="chip">
+          <Bell size={16} />
+          <b>{advice.decision.title}</b>
+          <span className="muted">— {advice.decision.reason}</span>
         </div>
-      </Section>
+        <div className="muted small">المكان: {resolvedPlace || "غير محدد"}</div>
+      </section>
 
-      {/* 2) المحصول والمساحة */}
-      <Section title="المحصول والمساحة">
-        <Row label="المحصول">
-          <select value={crop} onChange={e => setCrop(e.target.value)} className="input">
-            <option value="fraise">🍓 فراولة</option>
-            <option value="framboise">🫐 فرامبواز</option>
-            <option value="avocat">🥑 أفوكا</option>
-          </select>
-        </Row>
-        <Row label="المساحة (م²)">
-          <input type="number" className="input" value={area} min={10} step={10} onChange={e => setArea(e.target.value)} />
-        </Row>
-        <Row label="الزون / وصف">
-          <input className="input" value={zone} onChange={e => setZone(e.target.value)} />
-        </Row>
-      </Section>
-
-      {/* 3) شبكة الري */}
-      <Section title="شبكة الري">
-        <Row label="صبيب المضخة (L/h)">
-          <input type="number" className="input" value={pumpFlowLh} min={0} step={50} onChange={e => setPumpFlowLh(e.target.value)} placeholder="0 = حسب النقاطات" />
-        </Row>
-        <Row label="نقاطات/م²">
-          <input type="number" className="input" value={emittersPerM2} min={0} step={1} onChange={e => setEmittersPerM2(e.target.value)} />
-        </Row>
-        <Row label="صبيب النقاطة (L/h)">
-          <input type="number" className="input" value={emitterFlowLh} min={0} step={0.5} onChange={e => setEmitterFlowLh(e.target.value)} />
-        </Row>
-        <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-          إن كان صبيب المضخة أكبر من 0 سيتم اعتماده، وإلا فالحساب حسب عدد النقاطات × صبيبها.
-        </div>
-      </Section>
-
-      {/* 4) الحساب والتوصية */}
-      <Section title="التوصية">
-        <div className="pill" style={{ borderColor:'#dbeafe', background:'#eff6ff', marginBottom:8 }}>
-          <p className="muted" style={{ margin:0 }}>الكمية المقترحة</p>
-          <p style={{ fontSize:28, fontWeight:700, margin:'6px 0 0 0' }}>{advice.liters} لتر</p>
-        </div>
-        <div className="pill" style={{ borderColor:'#bbf7d0', background:'#ecfdf5', marginBottom:8 }}>
-          <p className="muted" style={{ margin:0 }}>مدة التشغيل التقريبية</p>
-          <p style={{ fontSize:28, fontWeight:700, margin:'6px 0 0 0' }}>~ {advice.minutes} دقيقة</p>
-        </div>
-        <div className="pill" style={{ borderColor:'#fde68a', background:'#fef9c3' }}>
-          <p style={{ margin:0 }}><Info size={14}/> {advice.tip}</p>
-        </div>
-      </Section>
-
-      {/* 5) أزرار المشاركة/الحفظ */}
-      <Section title="الإجراءات">
-        <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
-          <button
-            className="btn"
-            onClick={() => {
-              const msg = `💧 توصية السقي
-• المحصول: ${crop === 'fraise' ? 'فراولة' : crop === 'avocat' ? 'أفوكا' : 'فرامبواز'}
-• المكان: ${placeName || 'غير محدد'}
-• المعطيات: حرارة ${temp}°C • رطوبة ${humidity}% • ريح ${wind} كم/س
-• الكمية: ${advice.liters} لتر لمساحة ${area} م²
-• المدة: ~${advice.minutes} دقيقة
-(Agrimoga)`
-              const url = `https://wa.me/?text=${encodeURIComponent(msg)}`
-              window.open(url, '_blank')
-            }}
-          >
-            <Share2 size={16}/> شارك عبر WhatsApp
-          </button>
-
-          <button className="btn" onClick={addToLog}>حفظ في السجل</button>
-        </div>
-      </Section>
-
-      {/* 6) سجل السقي */}
-      <Section title="سجل السقي" hint="محفوظ محلياً في المتصفح">
-        {log.length === 0 ? (
-          <div className="muted">لا توجد مدخلات.</div>
-        ) : (
-          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-            {log.map((e, i) => (
-              <div key={i} className="pill" style={{ display:'grid', gridTemplateColumns:'1fr auto', alignItems:'center' }}>
-                <div>
-                  <div style={{ fontWeight:600 }}>{e.liters} L • ~{e.minutes} د</div>
-                  <div className="muted" style={{ fontSize:12 }}>
-                    {e.at} — {e.crop} • {e.area} م² • {e.place} — طقس: {e.wx.temp}°C/{e.wx.humidity}%/{e.wx.wind}كم/س {e.wx.rainyTomorrow ? '— شتا غداً' : ''}
-                  </div>
-                </div>
-                <button
+      {/* تخطيط عمودي احترافي */}
+      <div className="stack">
+        {/* Quick panel */}
+        <Card title="السقي — توصية سريعة" open={open.quick} onToggle={() => setOpen((s) => ({ ...s, quick: !s.quick }))}>
+          <div className="grid2">
+            <div className="formrow">
+              <label className="label">ابحث عن مكان</label>
+              <div className="hstack">
+                <input
                   className="input"
-                  onClick={() => { const next = log.filter((_, j) => j !== i); setLog(next); saveJSON(LS_LOG, next) }}
-                  style={{ cursor:'pointer' }}
-                >
-                  حذف
+                  placeholder="Kenitra / Larache ..."
+                  value={placeQuery}
+                  onChange={(e) => setPlaceQuery(e.target.value)}
+                />
+                <button className="btn ghost" onClick={handleCityFetch} disabled={loadingWx || !OWM_KEY}>
+                  <Cloud size={16} /> جيب الطقس
                 </button>
               </div>
-            ))}
+              <label className="switch">
+                <input type="checkbox" checked={autoGPS} onChange={(e) => setAutoGPS(e.target.checked)} />
+                <span>
+                  <Locate size={14} /> تفعيل GPS تلقائياً
+                </span>
+              </label>
+              {err && <p className="err">⚠️ {err}</p>}
+              {loadingWx && <p className="muted small">… كنجلبو الطقس</p>}
+            </div>
+
+            <div className="sliders">
+              <Range label={<><Thermometer size={14}/> حرارة</>} value={temp} set={setTemp} min={-5} max={45}/>
+              <Range label={<><Droplets size={14}/> رطوبة/مطر</>} value={rain} set={setRain} min={0} max={100} step={5}/>
+              <Range label={<><Wind size={14}/> الريح</>} value={wind} set={setWind} min={0} max={90} step={5}/>
+              <label className="switch" style={{marginTop:6}}>
+                <input type="checkbox" checked={rainyTomorrow} onChange={e=>setRainyTomorrow(e.target.checked)} />
+                <span>مطر متوقع غداً؟ {rainyTomorrow ? "نعم" : "لا"}</span>
+              </label>
+            </div>
           </div>
-        )}
-      </Section>
+        </Card>
+
+        {/* Field panel */}
+        <Card title="المحصول والقطعة" open={open.field} onToggle={() => setOpen((s) => ({ ...s, field: !s.field }))}>
+          <div className="grid2">
+            <div className="formrow">
+              <label className="label">المحصول</label>
+              <select className="input" value={crop} onChange={(e) => setCrop(e.target.value)}>
+                <option value="fraise">🍓 فراولة</option>
+                <option value="framboise">🫐 فرامبواز</option>
+                <option value="avocat">🥑 أفوكا</option>
+              </select>
+            </div>
+            <div className="formrow">
+              <label className="label">القطعة</label>
+              <input className="input" value={zoneName} onChange={(e) => setZoneName(e.target.value)} />
+            </div>
+            <div className="formrow">
+              <label className="label">المساحة (م²)</label>
+              <input
+                type="number"
+                className="input"
+                value={areaM2}
+                onChange={(e) => setAreaM2(Math.max(0, +e.target.value || 0))}
+              />
+            </div>
+            <div className="formrow">
+              <label className="label">النقاط/م²</label>
+              <input
+                type="number"
+                className="input"
+                value={emittersPerM2}
+                onChange={(e) => setEmittersPerM2(Math.max(0, +e.target.value || 0))}
+              />
+            </div>
+            <div className="formrow">
+              <label className="label">صبيب النقطة (ل/ساعة)</label>
+              <input
+                type="number"
+                className="input"
+                value={emitterLph}
+                onChange={(e) => setEmitterLph(Math.max(0, +e.target.value || 0))}
+              />
+            </div>
+            <div className="pill muted">
+              الصبيب الإجمالي:{" "}
+              <b>
+                {Math.round((emittersPerM2 || 0) * (areaM2 || 0) * (emitterLph || 0))} ل/ساعة
+              </b>
+            </div>
+          </div>
+        </Card>
+
+        {/* Summary panel */}
+        <Card title="التوصية" open={open.summary} onToggle={() => setOpen((s) => ({ ...s, summary: !s.summary }))}>
+          <div className="grid3">
+            <div className="pill">
+              <p className="muted">الكمية المقترحة</p>
+              <p className="big">{advice.liters} L</p>
+              <p className="muted">للمساحة: {areaM2} م²</p>
+            </div>
+            <div className="pill">
+              <p className="muted">مدة التشغيل التقديرية</p>
+              <p className="big">~ {advice.minutes} د</p>
+              <p className="muted">حسب الصبيب الإجمالي</p>
+            </div>
+            <div className="pill">
+              <p className="muted">نصيحة</p>
+              <p>{advice.tip}</p>
+            </div>
+          </div>
+
+          <div className="hstack">
+            <button className="btn primary" onClick={addHistoryNote}>
+              سجّل العملية
+            </button>
+            <button className="btn" onClick={shareWhatsApp}>
+              <Share2 size={16} /> مشاركة عبر WhatsApp
+            </button>
+          </div>
+        </Card>
+
+        {/* History */}
+        <Card title="سِجل السقي" open={open.history} onToggle={() => setOpen((s) => ({ ...s, history: !s.history }))}>
+          {history.length === 0 ? (
+            <p className="muted">لا توجد مدخلات.</p>
+          ) : (
+            <div className="table">
+              <div className="thead">
+                <div>التاريخ</div>
+                <div>القطعة</div>
+                <div>المكان</div>
+                <div>الكمية</div>
+                <div>المدة</div>
+              </div>
+              {history.map((h, i) => (
+                <div className="trow" key={i}>
+                  <div>{new Date(h.at).toLocaleString("ar-MA")}</div>
+                  <div>{h.zoneName}</div>
+                  <div>{h.place}</div>
+                  <div>{h.liters} L</div>
+                  <div>{h.minutes} د</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
+    </div>
+  )
+}
+
+// مكوّنات صغيرة للواجهة
+function Card({ title, open, onToggle, children }) {
+  return (
+    <section className={`card pro ${open ? "open" : ""}`}>
+      <button className="card-head" onClick={onToggle} type="button">
+        <span className="caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+        <h3>{title}</h3>
+      </button>
+      {open && <div className="card-body">{children}</div>}
+    </section>
+  )
+}
+function Range({ label, value, set, min, max, step = 1 }) {
+  return (
+    <div className="range">
+      <label className="label">{label}: <b>{value}</b></label>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e)=>set(+e.target.value)} />
     </div>
   )
 }
