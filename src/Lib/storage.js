@@ -7,6 +7,7 @@ export function loadJSON(key, fallback) {
     return fallback;
   }
 }
+
 export function saveJSON(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
