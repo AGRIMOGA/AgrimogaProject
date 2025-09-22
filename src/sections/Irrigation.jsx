@@ -1,490 +1,369 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  Thermometer, Wind, Droplets, Bell, Calendar, Locate, WifiOff, Share2, MapPin, RotateCw, Plus, Trash2, Download
-} from 'lucide-react'
-import { loadJSON, saveJSON } from '@/Lib/storage'
+// src/sections/Irrigation.jsx
+import {useEffect, useMemo, useState} from 'react'
+import { Thermometer, Wind, Droplets, MapPin, Locate, Share2, Calendar, AlertTriangle, RefreshCcw } from 'lucide-react'
+import { loadJSON, saveJSON } from '@/lib/storage'
 import { useI18n } from '@/i18n/context'
 
-/** ====== OpenWeather ====== **/
-const OWM_API_KEY = import.meta.env.VITE_OWM_API_KEY
+/* ===================== ثوابت بسيطة ===================== */
 
-async function fetchForecast(lat, lon, lang) {
-  const url = `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&lang=${lang}&appid=${OWM_API_KEY}`
-  const res = await fetch(url)
-  if (!res.ok) throw new Error('forecast_failed')
-  return await res.json()
+// مفاتيح التخزين
+const LS_FORM = 'agrimoga:irrig:form'
+const LS_LOG  = 'agrimoga:irrig:log'
+
+// Presets حسب المحصول والزون
+const PRESETS = {
+  fraise: {
+    name: 'فراولة',
+    zones: {
+      'Zone A — 100 m²': { plants: 400, drippersPerPlant: 4, dripperFlow: 2 }, // 2 L/h
+      'Zone B — 250 m²': { plants: 900, drippersPerPlant: 4, dripperFlow: 2 },
+    }
+  },
+  framboise: {
+    name: 'فرامبواز',
+    zones: {
+      'Zone A — 100 m²': { plants: 250, drippersPerPlant: 2, dripperFlow: 2 },
+      'Zone B — 250 m²': { plants: 600, drippersPerPlant: 2, dripperFlow: 2 },
+    }
+  },
+  avocat: {
+    name: 'أفوكا',
+    zones: {
+      'Zone A — 100 m²': { plants: 40, drippersPerPlant: 8, dripperFlow: 4 },  // 4 L/h
+      'Zone B — 250 m²': { plants: 90, drippersPerPlant: 8, dripperFlow: 4 },
+    }
+  },
 }
 
-/** Reverse geocoding: OWM then OSM (fallback) */
-async function reverseOWM(lat, lon) {
-  const url = `https://api.openweathermap.org/geo/1.0/reverse?lat=${lat}&lon=${lon}&limit=5&appid=${OWM_API_KEY}`
-  const r = await fetch(url)
-  if (!r.ok) throw new Error('owm_rev_failed')
-  const arr = await r.json()
-  if (!Array.isArray(arr) || arr.length === 0) throw new Error('owm_rev_empty')
-  for (const it of arr) {
-    const cand = it.local_names?.ar || it.local_names?.fr || it.local_names?.en || it.name
-    if (cand) return cand
-  }
-  return arr[0].name
-}
-async function reverseOSM(lat, lon, lang) {
-  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&accept-language=${lang}&zoom=12`
-  const r = await fetch(url, { headers: { 'User-Agent': 'agrimoga-mvp/1.0' } })
-  if (!r.ok) throw new Error('osm_rev_failed')
-  const j = await r.json()
-  const a = j.address || {}
-  const best = a.city || a.town || a.municipality || a.village || a.county || a.state || j.name || j.display_name
-  if (!best) throw new Error('osm_rev_empty')
-  return best
-}
-async function resolvePlaceName(lat, lon, lang) {
-  try { const n = await reverseOWM(lat, lon); if (n) return n } catch {}
-  try { const n2 = await reverseOSM(lat, lon, lang); return n2 } catch {}
-  return ''
+// حدود معقولة للمدخلات (Validation)
+const LIMITS = {
+  temp: [-5, 50],
+  wind: [0, 90],
+  rainPct: [0, 100],
+  dripperFlow: [0.5, 16],   // L/h
+  drippersPerPlant: [1, 16],
+  pumpFlow: [0, 50000],     // L/h شبكة السقي
 }
 
-/** Summarize 5-day/3h forecast into today's snapshot + rain tomorrow */
-function summarizeWeather(forecast) {
-  const list = forecast?.list || []
-  if (list.length === 0) return null
-  const now = list[0]
-  const temp = Math.round(now.main.temp)
-  const wind = Math.round(now.wind.speed * 3.6) // m/s -> km/h
-  const popToday = Math.round(
-    (list.slice(0, 8).reduce((s, it) => s + (it.pop || 0), 0) / Math.min(8, list.length)) * 100
-  )
-  const popTomorrow = Math.round(
-    (list.slice(8, 16).reduce((s, it) => s + (it.pop || 0), 0) /
-      Math.max(1, Math.min(8, Math.max(0, list.length - 8)))) * 100
-  )
-  const rainyTomorrow = popTomorrow >= 30
-  return { temp, wind, rain: popToday, rainyTomorrow }
+const kmh = v => `${v} كم/س`
+const deg = v => `${v}°C`
+const pct = v => `${v}%`
+
+/* ===================== دوال مساعدة ===================== */
+
+// تصحيح القيم داخل الحدود
+function clamp(v, [min, max]) {
+  if (Number.isNaN(+v)) return min
+  return Math.min(max, Math.max(min, +v))
 }
 
-/** Water advice (L) per 100m² baseline, adjusted by conditions */
-function getIrrigation({ crop, temp, rain, wind, rainyTomorrow, areaSize, lang, t }) {
-  const base = { fraise: 250, avocat: 400, framboise: 280 }[crop] // L / 100 m²
-  let liters = base
-  if (temp >= 35) liters *= 1.4
-  else if (temp >= 30) liters *= 1.2
-  else if (temp <= 10) liters *= 0.8
-  if (wind >= 40) liters *= 1.2
-  if (rain >= 60) liters *= 0.25
-  else if (rain >= 30) liters *= 0.6
-  const postpone = rainyTomorrow && rain < 20
-  const litersForArea = Math.round((liters / 100) * areaSize)
+// حساب كمية السقي باللتر لليوم
+function computeAdvice({crop, tempC, rainPct, windKmh, rainyTomorrow, plants, drippersPerPlant, dripperFlow}) {
+  // طلب أساسي لكل محصول (لتر/نبتة/اليوم)
+  const basePerPlant = crop === 'avocat' ? 18 : crop === 'framboise' ? 5 : 4
 
+  let mult = 1
+  // حرارة
+  if (tempC >= 35) mult *= 1.45
+  else if (tempC >= 30) mult *= 1.25
+  else if (tempC <= 10) mult *= 0.8
+  // ريح
+  if (windKmh >= 40) mult *= 1.15
+  // مطر/رطوبة
+  if (rainPct >= 60) mult *= 0.35
+  else if (rainPct >= 30) mult *= 0.65
+
+  const litersPerPlant = basePerPlant * mult
+  const totalLitersWanted = Math.max(0, Math.round(litersPerPlant * plants))
+
+  // حد أمان: ما نتعدّوش الطاقة القصوى للنقّاطات
+  const maxPerPlant = drippersPerPlant * dripperFlow // L/h لكل نبتة فساعة
+  const maxToday = Math.round(maxPerPlant * plants)  // L فساعة
+  const capped = Math.min(totalLitersWanted, Math.max(maxToday, 0))
+
+  // قرار بسيط
+  const postpone = rainyTomorrow && rainPct < 20
   const decision = postpone
-    ? { title: t('irr.tip.delay'), kind: 'postpone' }
-    : litersForArea < 80
-    ? { title: lang === 'fr' ? 'Arrosage léger' : lang === 'en' ? 'Light irrigation' : 'سقي خفيف', kind: 'light' }
-    : litersForArea > 500
-    ? { title: lang === 'fr' ? 'Arrosage important' : lang === 'en' ? 'Heavy irrigation' : 'سقي مهم', kind: 'heavy' }
-    : { title: lang === 'fr' ? 'Arrosage normal' : lang === 'en' ? 'Normal irrigation' : 'سقي عادي', kind: 'normal' }
+    ? { title: 'ماتسقيش اليوم', reason: 'غداً متوقع الشتا — أجّل إلا ما كاينش عطش واضح.' }
+    : capped < 0.5 * totalLitersWanted
+      ? { title: 'سقي خفيف', reason: 'الرطوبة/الجو كافي نسبياً اليوم.' }
+      : { title: 'سقي عادي', reason: 'ظروف متوسطة.' }
 
-  const cropTip =
-    crop === 'fraise'
-      ? (lang==='fr' ? 'Arroser par petites impulsions rapprochées.' :
-         lang==='en' ? 'Irrigate in short, frequent pulses.' :
-                       'سقي خفيف ومتكرر.')
-      : crop === 'avocat'
-      ? (lang==='fr' ? 'Arrosage profond et espacé.' :
-         lang==='en' ? 'Deep, infrequent irrigation.' :
-                       'سقي عميق وبعيد بين الدورات.')
-      : (lang==='fr' ? 'Équilibrer l’eau et assurer un bon drainage.' :
-         lang==='en' ? 'Balance water and ensure good drainage.' :
-                       'حافظ على توازن الماء وصرف جيد.')
-
-  return { liters: Math.max(litersForArea, 0), decision, tip: cropTip }
+  return {
+    liters: capped,
+    perPlant: Math.round(litersPerPlant),
+    decision,
+    tip: crop === 'avocat'
+      ? 'الأفوكا كيبغي سقي عميق وبعيد بين الدورات.'
+      : crop === 'framboise'
+        ? 'حافظ على توازن الماء وصرف جيد للجذور.'
+        : 'سقي خفيف ومتكرر للفراولة لتفادي تعفن الجذور.',
+  }
 }
 
-/** Flow & runtime helpers */
-function calcFlowLph({ pumpFlowM3h, emittersPerM2, emitterFlowLph, areaSize }) {
-  if (pumpFlowM3h && pumpFlowM3h > 0) return pumpFlowM3h * 1000 // m3/h -> L/h
-  return Math.max(0, (emittersPerM2 || 0) * (emitterFlowLph || 0) * areaSize)
-}
-function calcRuntimeMin(liters, flowLph) {
-  return flowLph > 0 ? Math.max(1, Math.round((liters / flowLph) * 60)) : 0
+// مدة التشغيل = الكمية / صبيب الشبكة
+function minutesFromFlow(totalLiters, pumpFlowLh) {
+  if (!pumpFlowLh || pumpFlowLh <= 0) return null
+  const hours = totalLiters / pumpFlowLh
+  return Math.round(hours * 60)
 }
 
-/** Storage keys */
-const LS_LAST = 'agrimoga:lastAdvice'
-const LS_FORM = 'agrimoga:waterForm'
-const LS_LOGS = 'agrimoga:irrigLogs'
+// مشاركة واتساب
+function buildShare({crop, zone, place, liters, minutes, tempC, windKmh, rainPct}) {
+  const cropName = PRESETS[crop]?.name || crop
+  const lines = [
+    '💧 توصية السقي (Agrimoga)',
+    `• المحصول: ${cropName}`,
+    `• الزون: ${zone}`,
+    `• المكان: ${place || 'غير محدد'}`,
+    `• الطقس: حرارة ${tempC}°C • ريح ${windKmh} كم/س • رطوبة/مطر ${rainPct}%`,
+    `• الكمية: ${liters} لتر${minutes ? ` • المدة ~ ${minutes} د` : ''}`,
+  ]
+  return `https://wa.me/?text=${encodeURIComponent(lines.join('\n'))}`
+}
 
-export default function Irrigation() {
-  const { t, lang } = useI18n()
+/* ===================== الكومبونون ===================== */
 
-  // --- form state (with zones & network) ---
+export default function Irrigation(){
+  const { t } = useI18n()
+
+  // الحالة الابتدائية من التخزين المحلي
   const s0 = loadJSON(LS_FORM, {
     crop: 'fraise',
-    areaSize: 100,
-    zones: [{ id: 'A', name: 'Zone A', area: 100 }],
-    zoneId: 'A',
-    pumpFlowM3h: 0,
-    emittersPerM2: 4,
-    emitterFlowLph: 2,
+    zone: 'Zone A — 100 m²',
+    pumpFlow: 800,                 // L/h
+    tempC: 20, windKmh: 5, rainPct: 10, rainyTomorrow: false,
+    place: '',
   })
+
   const [crop, setCrop] = useState(s0.crop)
-  const [zones, setZones] = useState(s0.zones)
-  const [zoneId, setZoneId] = useState(s0.zoneId)
-  const areaSize = useMemo(() => (zones.find(z => z.id === zoneId)?.area) ?? 100, [zones, zoneId])
+  const [zone, setZone] = useState(s0.zone)
+  const [pumpFlow, setPumpFlow] = useState(s0.pumpFlow)
 
-  const [pumpFlowM3h, setPumpFlowM3h] = useState(s0.pumpFlowM3h)
-  const [emittersPerM2, setEmittersPerM2] = useState(s0.emittersPerM2)
-  const [emitterFlowLph, setEmitterFlowLph] = useState(s0.emitterFlowLph)
+  const [tempC, setTempC] = useState(s0.tempC)
+  const [windKmh, setWindKmh] = useState(s0.windKmh)
+  const [rainPct, setRainPct] = useState(s0.rainPct)
+  const [rainyTomorrow, setRainyTomorrow] = useState(s0.rainyTomorrow)
 
-  // --- weather & gps ---
-  const [temp, setTemp] = useState(28)
-  const [rain, setRain] = useState(10)
-  const [wind, setWind] = useState(15)
-  const [rainyTomorrow, setRainyTomorrow] = useState(false)
-  const [place, setPlace] = useState('')
-  const [accuracy, setAccuracy] = useState(null) // m
+  const [place, setPlace] = useState(s0.place)
+  const [loadingWx, setLoadingWx] = useState(false)
+  const [err, setErr] = useState('')
 
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [offline, setOffline] = useState(!navigator.onLine)
-  const [showAdvice, setShowAdvice] = useState(false)
-  const triedAuto = useRef(false)
+  // استرجاع الـ preset
+  const preset = PRESETS[crop]?.zones?.[zone] || {plants: 300, drippersPerPlant: 2, dripperFlow: 2}
 
-  // logs
-  const [logs, setLogs] = useState(loadJSON(LS_LOGS, []))
+  // القيم القابلة للتعديل
+  const [plants, setPlants] = useState(preset.plants)
+  const [drippersPerPlant, setDrpPerPlant] = useState(preset.drippersPerPlant)
+  const [dripperFlow, setDrpFlow] = useState(preset.dripperFlow)
 
-  // advice
-  const advice = useMemo(
-    () => getIrrigation({ crop, temp, rain, wind, rainyTomorrow, areaSize, lang, t }),
-    [crop, temp, rain, wind, rainyTomorrow, areaSize, lang, t]
-  )
-  const flowLph = useMemo(() => calcFlowLph({ pumpFlowM3h, emittersPerM2, emitterFlowLph, areaSize }), [pumpFlowM3h, emittersPerM2, emitterFlowLph, areaSize])
-  const minutes = useMemo(() => calcRuntimeMin(advice.liters, flowLph), [advice.liters, flowLph])
-
-  // persist form
-  useEffect(() => {
-    saveJSON(LS_FORM, { crop, zones, zoneId, pumpFlowM3h, emittersPerM2, emitterFlowLph })
-  }, [crop, zones, zoneId, pumpFlowM3h, emittersPerM2, emitterFlowLph])
-
-  // online/offline
-  useEffect(() => {
-    const on = () => setOffline(false)
-    const off = () => setOffline(true)
-    window.addEventListener('online', on)
-    window.addEventListener('offline', off)
-    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
-  }, [])
-
-  // load last snapshot
-  useEffect(() => {
-    const s = loadJSON(LS_LAST, null)
-    if (s) {
-      setCrop(s.crop); setTemp(s.temp); setRain(s.rain); setWind(s.wind)
-      setRainyTomorrow(!!s.rainyTomorrow); setPlace(s.place || ''); setAccuracy(s.accuracy ?? null)
-      setShowAdvice(true)
+  // كلما تبدّلات crop/zone رجّع قيم الـ preset
+  useEffect(()=>{
+    const p = PRESETS[crop]?.zones?.[zone]
+    if (p) {
+      setPlants(p.plants)
+      setDrpPerPlant(p.drippersPerPlant)
+      setDrpFlow(p.dripperFlow)
     }
-  }, [])
+  }, [crop, zone])
 
-  // auto GPS once
-  useEffect(() => {
-    if (triedAuto.current) return
-    triedAuto.current = true
-    locateWithGPS()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // حفظ تلقائي
+  useEffect(()=>{
+    saveJSON(LS_FORM, { crop, zone, pumpFlow, tempC, windKmh, rainPct, rainyTomorrow, place })
+  }, [crop, zone, pumpFlow, tempC, windKmh, rainPct, rainyTomorrow, place])
 
-  // persist snapshot
-  useEffect(() => {
-    if (!showAdvice) return
-    saveJSON(LS_LAST, { crop, temp, rain, wind, rainyTomorrow, areaSize, place, accuracy, savedAt: Date.now() })
-  }, [showAdvice, crop, temp, rain, wind, rainyTomorrow, areaSize, place, accuracy])
+  // Validation خفيف على الطاير
+  const vTemp     = clamp(tempC, LIMITS.temp)
+  const vWind     = clamp(windKmh, LIMITS.wind)
+  const vRain     = clamp(rainPct, LIMITS.rainPct)
+  const vDrpFlow  = clamp(dripperFlow, LIMITS.dripperFlow)
+  const vDrpN     = clamp(drippersPerPlant, LIMITS.drippersPerPlant)
+  const vPlants   = Math.max(1, Math.round(plants || 1))
+  const vPumpFlow = pumpFlow ? Math.max(0, +pumpFlow) : 0
 
-  /** ===== actions ===== */
-  async function locateWithGPS() {
-    setError('')
-    setLoading(true)
-    if (!navigator.geolocation) {
-      setError(lang==='fr' ? 'GPS non supporté' : lang==='en' ? 'GPS not supported' : 'GPS غير مدعوم')
-      setLoading(false); return
-    }
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const { latitude: lat, longitude: lon, accuracy: acc } = pos.coords
-          setAccuracy(Math.round(acc || 0))
-          const fc = await fetchForecast(lat, lon, lang)
-          const s = summarizeWeather(fc)
-          if (!s) throw new Error('summ_empty')
-          setTemp(s.temp); setRain(s.rain); setWind(s.wind); setRainyTomorrow(s.rainyTomorrow)
-          const name = await resolvePlaceName(lat, lon, lang)
-          setPlace(name || (lang==='fr' ? 'Localisation approximative' : lang==='en' ? 'Approximate location' : 'موقع تقريبي'))
-          setShowAdvice(true)
-        } catch (e) {
-          setError(lang==='fr' ? 'Erreur localisation/météo' : lang==='en' ? 'Location/Weather error' : 'مشكلة في تحديد الموقع/الطقس')
-        } finally { setLoading(false) }
-      },
-      () => { setError(lang==='fr' ? 'Autorisez la localisation' : lang==='en' ? 'Allow location access' : 'خاص ترخيص GPS من المتصفح'); setLoading(false) },
-      { enableHighAccuracy: true, maximumAge: 20_000, timeout: 12_000 }
-    )
-  }
+  // حسابات
+  const totalDrippers = vPlants * vDrpN
+  const maxNetworkLh  = totalDrippers * vDrpFlow // L/h ممكن يخرّج من النقّاطات
+  const advice = useMemo(()=>computeAdvice({
+    crop, tempC:vTemp, rainPct:vRain, windKmh:vWind, rainyTomorrow,
+    plants: vPlants, drippersPerPlant: vDrpN, dripperFlow: vDrpFlow
+  }), [crop, vTemp, vRain, vWind, rainyTomorrow, vPlants, vDrpN, vDrpFlow])
 
-  function shareWhatsApp() {
-    const cropName =
-      crop === 'fraise' ? (lang==='fr' ? 'Fraise' : lang==='en' ? 'Strawberry' : 'فراولة')
-      : crop === 'avocat' ? (lang==='fr' ? 'Avocat' : lang==='en' ? 'Avocado' : 'أفوكادو')
-      : (lang==='fr' ? 'Framboise' : lang==='en' ? 'Raspberry' : 'فرامبواز')
-    const txt =
-`${lang==='fr' ? 'Recommandation irrigation' : lang==='en' ? 'Irrigation advice' : 'التوصية ديال السقي'}
-• ${t('irr.crop')}: ${cropName}
-• ${lang==='fr' ? 'Lieu' : lang==='en' ? 'Place' : 'المكان'}: ${place || (lang==='fr' ? 'Non spécifié' : lang==='en' ? 'Not set' : 'غير محدد')}
-• ${lang==='fr' ? 'Aujourd’hui' : lang==='en' ? 'Today' : 'اليوم'}: ${temp}°C • ${lang==='fr' ? 'Vent' : lang==='en' ? 'Wind' : 'ريح'} ${wind} km/h • ${lang==='fr' ? 'Pluie' : lang==='en' ? 'Rain' : 'شتا'} ${rain}%
-• ${lang==='fr' ? 'Quantité' : lang==='en' ? 'Amount' : 'الكمية'}: ${advice.liters} L / ${areaSize} m²
-• ${lang==='fr' ? 'Durée' : lang==='en' ? 'Duration' : 'المدّة'}: ~${minutes} ${lang==='fr' ? 'min' : lang==='en' ? 'min' : 'د'}
-• ${lang==='fr' ? 'Note' : lang==='en' ? 'Note' : 'الملاحظة'}: ${advice.decision.title}
-(Agrimoga)`
-    window.open(`https://wa.me/?text=${encodeURIComponent(txt)}`, '_blank')
-  }
+  const minutes = minutesFromFlow(advice.liters, vPumpFlow)
+  const shareURL = buildShare({crop, zone, place, liters: advice.liters, minutes, tempC:vTemp, windKmh:vWind, rainPct:vRain})
 
-  function addZone() {
-    const name = prompt(lang==='fr' ? 'Nom de la zone ?' : lang==='en' ? 'Zone name?' : 'إسم الزون؟')
-    if (!name) return
-    const a = Number(prompt(lang==='fr' ? 'Superficie (m²) ?' : lang==='en' ? 'Area (m²)?' : 'المساحة (م²)؟') || 0)
-    if (!(a > 0)) return
-    const id = `${Date.now()}`
-    const next = [...zones, { id, name, area: a }]
-    setZones(next); setZoneId(id)
-  }
-  function removeZone() {
-    if (!zoneId) return
-    const next = zones.filter(z => z.id !== zoneId)
-    setZones(next)
-    if (next.length) setZoneId(next[0].id)
-  }
-
-  function logCurrent() {
-    const z = zones.find(z => z.id === zoneId)
-    const item = {
-      ts: Date.now(),
-      crop, place,
-      zone: z?.name || '',
-      area: areaSize,
+  // لوج سجل السقي
+  const addLog = () => {
+    const logs = loadJSON(LS_LOG, [])
+    logs.unshift({
+      at: Date.now(),
+      crop, zone, place,
       liters: advice.liters,
       minutes,
-    }
-    const next = [item, ...logs].slice(0, 100)
-    setLogs(next)
-    saveJSON(LS_LOGS, next)
-    alert(lang==='fr' ? 'Enregistré.' : lang==='en' ? 'Saved.' : 'تسجّل.')
+      weather: { tempC:vTemp, windKmh:vWind, rainPct:vRain, rainyTomorrow }
+    })
+    saveJSON(LS_LOG, logs.slice(0, 200)) // نحتافظو بآخر 200 عملية
   }
-  function clearLogs() {
-    if (!confirm(lang==='fr' ? 'Effacer le journal ?' : lang==='en' ? 'Clear logs?' : 'تمسح السجل؟')) return
-    setLogs([]); saveJSON(LS_LOGS, [])
-  }
-  function exportCSV() {
-    const rows = [
-      ['date','crop','place','zone','area_m2','liters','minutes'],
-      ...logs.map(x => [
-        new Date(x.ts).toISOString(),
-        x.crop, x.place, x.zone, x.area, x.liters, x.minutes
-      ])
-    ]
-    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n')
-    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'})
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url; a.download = 'irrigation_logs.csv'; a.click()
-    URL.revokeObjectURL(url)
+
+  // GPS + OpenWeather (اختياري)
+  const OWM = import.meta.env.VITE_OWM_API_KEY
+  async function handleUseGPS(){
+    setErr('')
+    try{
+      if (!navigator.geolocation) throw new Error('GPS غير مدعوم')
+      setLoadingWx(true)
+      const pos = await new Promise((ok, ko)=>{
+        navigator.geolocation.getCurrentPosition(ok, e=>ko(new Error('رفض إذن GPS')))
+      })
+      const { latitude: lat, longitude: lon } = pos.coords
+
+      if (!OWM) throw new Error('مفتاح الطقس غير مضاف (VITE_OWM_API_KEY)')
+
+      const u = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&units=metric&lang=ar&appid=${OWM}`
+      const res = await fetch(u)
+      if (!res.ok) throw new Error('تعذّر جلب الطقس')
+      const json = await res.json()
+
+      setTempC(Math.round(json.main?.temp ?? vTemp))
+      setWindKmh(Math.round((json.wind?.speed ?? vWind) * 3.6))
+      setRainPct(Math.round((json.clouds?.all ?? vRain))) // تقريب بسيط
+      setPlace(json.name || 'GPS')
+    }catch(e){ setErr(e.message || 'مشكل غير متوقع') }
+    finally{ setLoadingWx(false) }
   }
 
   return (
-    <>
-      {offline && (
-        <div className="alert" style={{ maxWidth: 600 }}>
-          <WifiOff size={14} style={{ verticalAlign: '-2px' }} />{' '}
-          {lang==='fr' ? 'Hors ligne. Dernière recommandation affichée.' :
-           lang==='en' ? 'Offline. Showing last saved advice.' :
-                         'راك أوفلاين. نعرضو آخر توصية محفوظة.'}
-        </div>
-      )}
+    <div className="card">
+      <h3 style={{marginTop:0}}>{t('irrigation.title') || 'السقي — توصيات دقيقة'}</h3>
 
-      <div className="grid2 section">
-        {/* الطقس */}
-        <div className="card">
-          <h3 style={{ marginTop: 0 }}>{t('irr.title')}</h3>
-
-          <div className="pill" style={{ marginBottom: 10, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
-            <MapPin size={14} /> {place || (lang==='fr' ? 'En attente de localisation…' : lang==='en' ? 'Waiting for location…' : 'كنتسناو تحديد الموقع…')}
-            {accuracy!=null && (
-              <span className="muted">
-                {lang==='fr' ? 'Précision' : lang==='en' ? 'Accuracy' : 'الدقّة'} ±{accuracy}m {accuracy>1000 ? (lang==='fr' ? '(approx.)' : lang==='en' ? '(approx.)' : '(تقريباً)') : ''}
-              </span>
-            )}
-            <button className="input" onClick={locateWithGPS} disabled={loading} style={{ cursor:'pointer', marginInlineStart:'auto' }}>
-              <RotateCw size={14}/> {lang==='fr' ? 'Mettre à jour' : lang==='en' ? 'Refresh' : 'تحديث'}
-            </button>
-          </div>
-
-          <div className="grid3">
-            <div>
-              <label className="label"><Thermometer size={14}/> {t('diseases.temp')}: {temp}°C</label>
-              <input type="range" min={-5} max={45} step={1} value={temp} onChange={e=>setTemp(+e.target.value)} style={{ width: '100%' }} />
-            </div>
-            <div>
-              <label className="label"><Droplets size={14}/> {t('diseases.rain')}: {rain}%</label>
-              <input type="range" min={0} max={100} step={5} value={rain} onChange={e=>setRain(+e.target.value)} style={{ width: '100%' }} />
-            </div>
-            <div>
-              <label className="label"><Wind size={14}/> {lang==='fr' ? 'Vent' : lang==='en' ? 'Wind' : 'الريح'}: {wind} km/h</label>
-              <input type="range" min={0} max={90} step={5} value={wind} onChange={e=>setWind(+e.target.value)} style={{ width: '100%' }} />
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 }}>
-            <input type="checkbox" checked={rainyTomorrow} onChange={(e)=>setRainyTomorrow(e.target.checked)} />
-            <span className="label" style={{ marginTop: 0 }}>
-              <Calendar size={14} /> {lang==='fr' ? 'Pluie demain ?' : lang==='en' ? 'Rain tomorrow?' : 'مطر متوقع غداً؟'} {rainyTomorrow ? (lang==='fr' ? 'Oui' : lang==='en' ? 'Yes' : 'نعم') : (lang==='fr' ? 'Non' : lang==='en' ? 'No' : 'لا')}
-            </span>
-          </div>
-
-          <button className="btn" onClick={()=>setShowAdvice(true)} style={{ marginTop: 10 }}>
-            <Bell size={16} /> {lang==='fr' ? 'Donner la recommandation' : lang==='en' ? 'Give recommendation' : 'عطيني التوصية'}
-          </button>
-        </div>
-
-        {/* إعدادات الحقل + الزونات + الشبكة */}
-        <div className="card">
-          <h3 style={{ marginTop: 0 }}>{t('irr.crop')}</h3>
-          <select value={crop} onChange={e=>setCrop(e.target.value)} className="input">
-            <option value="fraise">🍓 {t('crop.fraise')}</option>
-            <option value="avocat">🥑 {t('crop.avocat')}</option>
-            <option value="framboise">🫐 {t('crop.framboise')}</option>
+      {/* المحصول والزون */}
+      <div className="grid2">
+        <div>
+          <label className="label">المحصول</label>
+          <select className="input" value={crop} onChange={e=>setCrop(e.target.value)}>
+            <option value="fraise">🍓 فراولة</option>
+            <option value="framboise">🫐 فرامبواز</option>
+            <option value="avocat">🥑 أفوكا</option>
           </select>
-
-          <div className="section">
-            <label className="label">{lang==='fr' ? 'Zone' : lang==='en' ? 'Zone' : 'الزون'}</label>
-            <div style={{display:'flex', gap:8}}>
-              <select className="input" value={zoneId} onChange={e=>setZoneId(e.target.value)}>
-                {zones.map(z => <option key={z.id} value={z.id}>{z.name} — {z.area} m²</option>)}
-              </select>
-              <button className="input" onClick={addZone} style={{cursor:'pointer'}}><Plus size={14}/> {lang==='fr' ? 'Ajouter' : lang==='en' ? 'Add' : 'إضافة'}</button>
-              <button className="input" onClick={removeZone} style={{cursor:'pointer'}}><Trash2 size={14}/> {lang==='fr' ? 'Supprimer' : lang==='en' ? 'Remove' : 'حذف'}</button>
-            </div>
-          </div>
-
-          <div className="section">
-            <label className="label">{lang==='fr' ? 'Réseau' : lang==='en' ? 'Network' : 'شبكة الري'}</label>
-            <div className="grid3">
-              <div>
-                <label className="label">{lang==='fr' ? 'Débit pompe (m³/h)' : lang==='en' ? 'Pump flow (m³/h)' : 'صبيب المضخة (م³/س)'}</label>
-                <input type="number" min={0} step={0.1} className="input" value={pumpFlowM3h} onChange={e=>setPumpFlowM3h(+e.target.value||0)} />
-                <p className="muted" style={{margin:0}}>
-                  {lang==='fr' ? 'Si rempli, ignore les champs ci-dessous.' :
-                   lang==='en' ? 'If set, fields below are ignored.' :
-                                 'إذا عمرت هاد الحقل، كنهمل الحقول لتحت.'}
-                </p>
-              </div>
-              <div>
-                <label className="label">{lang==='fr' ? 'Émetteurs/m²' : lang==='en' ? 'Emitters/m²' : 'نقّاطات/م²'}</label>
-                <input type="number" min={0} step={0.1} className="input" value={emittersPerM2} onChange={e=>setEmittersPerM2(+e.target.value||0)} />
-              </div>
-              <div>
-                <label className="label">{lang==='fr' ? 'Débit émetteur (L/h)' : lang==='en' ? 'Emitter flow (L/h)' : 'صبيب النقّاطة (ل/س)'}</label>
-                <input type="number" min={0} step={0.1} className="input" value={emitterFlowLph} onChange={e=>setEmitterFlowLph(+e.target.value||0)} />
-              </div>
-            </div>
-          </div>
-
-          <div className="pill" style={{marginTop:10}}>
-            <p className="muted" style={{margin:0}}>
-              {lang==='fr' ? 'Débit total estimé' : lang==='en' ? 'Estimated total flow' : 'الصبيب الإجمالي التقديري'}: <b>{flowLph.toLocaleString()} L/h</b>
-            </p>
-          </div>
+        </div>
+        <div>
+          <label className="label">الزون</label>
+          <select className="input" value={zone} onChange={e=>setZone(e.target.value)}>
+            {Object.keys(PRESETS[crop].zones).map(z=> <option key={z} value={z}>{z}</option>)}
+          </select>
         </div>
       </div>
 
-      {/* التوصية + مدة التشغيل + مشاركة + لوج */}
-      {showAdvice && (
-        <div className="card section">
-          <h3 style={{ marginTop: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
-            <Bell size={18} /> {advice.decision.title}
-          </h3>
+      {/* إعداد الشبكة */}
+      <div className="grid3 section">
+        <div>
+          <label className="label">عدد النباتات</label>
+          <input className="input" type="number" value={vPlants}
+                 onChange={e=>setPlants(+e.target.value||1)} min={1}/>
+        </div>
+        <div>
+          <label className="label">عدد النقّاط/نبتة</label>
+          <input className="input" type="number" value={vDrpN}
+                 onChange={e=>setDrpPerPlant(+e.target.value||1)} min={1}/>
+        </div>
+        <div>
+          <label className="label">صبيب النقّاط (L/h)</label>
+          <input className="input" type="number" step="0.5" value={vDrpFlow}
+                 onChange={e=>setDrpFlow(+e.target.value||0.5)} min={0.5}/>
+        </div>
+      </div>
 
-          <div className="grid3">
-            <div className="pill">
-              <p className="muted">{lang==='fr' ? 'Quantité suggérée' : lang==='en' ? 'Suggested amount' : 'الكمية المقترحة'}</p>
-              <p style={{ fontSize: 28, fontWeight: 700 }}>{advice.liters} L</p>
-              <p className="muted">{lang==='fr' ? 'pour' : lang==='en' ? 'for' : 'لـ'} {areaSize} m²</p>
-            </div>
-            <div className="pill">
-              <p className="muted">{lang==='fr' ? 'Durée de fonctionnement' : lang==='en' ? 'Runtime' : 'مدّة التشغيل'}</p>
-              <p style={{ fontSize: 28, fontWeight: 700 }}>
-                ~{minutes} {lang==='fr' ? 'min' : lang==='en' ? 'min' : 'د'}
-              </p>
-              <p className="muted">{lang==='fr' ? 'Débit' : lang==='en' ? 'Flow' : 'الصبيب'}: {flowLph.toLocaleString()} L/h</p>
-            </div>
-            <div className="pill">
-              <p className="muted">{lang==='fr' ? 'Données du jour' : lang==='en' ? 'Today data' : 'معطيات اليوم'}</p>
-              <p>{lang==='fr' ? 'Temp.' : lang==='en' ? 'Temp' : 'حرارة'}: {temp}°C • {lang==='fr' ? 'Pluie' : lang==='en' ? 'Rain' : 'شتا'}: {rain}% • {lang==='fr' ? 'Vent' : lang==='en' ? 'Wind' : 'ريح'}: {wind} km/h</p>
-              <p className="muted">📍 {place || (lang==='fr' ? 'Non spécifié' : lang==='en' ? 'Not set' : 'غير محدد')}</p>
-            </div>
+      {/* الطقس السلايدرات */}
+      <div className="grid3 section">
+        <div>
+          <label className="label"><Thermometer size={14}/> حرارة: {deg(vTemp)}</label>
+          <input type="range" min={-5} max={50} step={1} value={vTemp}
+                 onChange={e=>setTempC(+e.target.value)} style={{width:'100%'}}/>
+        </div>
+        <div>
+          <label className="label"><Droplets size={14}/> رطوبة/مطر: {pct(vRain)}</label>
+          <input type="range" min={0} max={100} step={5} value={vRain}
+                 onChange={e=>setRainPct(+e.target.value)} style={{width:'100%'}}/>
+        </div>
+        <div>
+          <label className="label"><Wind size={14}/> الريح: {kmh(vWind)}</label>
+          <input type="range" min={0} max={90} step={1} value={vWind}
+                 onChange={e=>setWindKmh(+e.target.value)} style={{width:'100%'}}/>
+        </div>
+      </div>
+
+      {/* مطر غداً + الطقس عبر GPS */}
+      <div className="grid2">
+        <div style={{display:'flex', alignItems:'center', gap:8}}>
+          <input id="rain-tom" type="checkbox" checked={rainyTomorrow} onChange={e=>setRainyTomorrow(e.target.checked)}/>
+          <label htmlFor="rain-tom" className="label" style={{marginTop:0}}><Calendar size={14}/> مطر متوقع غداً؟</label>
+        </div>
+        <div style={{display:'flex', gap:8}}>
+          <input className="input" placeholder="المكان (اختياري)" value={place} onChange={e=>setPlace(e.target.value)}/>
+          <button className="btn" onClick={handleUseGPS} disabled={loadingWx} title="GPS + الطقس">
+            <span style={{display:'inline-flex',alignItems:'center',gap:6}}>
+              {loadingWx ? <RefreshCcw size={16} className="animate-spin"/> : <Locate size={16}/>} جيّب الطقس
+            </span>
+          </button>
+        </div>
+      </div>
+      {err && <p style={{color:'#dc2626', marginTop:6}}>⚠️ {err}</p>}
+
+      {/* صبيب الشبكة */}
+      <div className="grid2 section">
+        <div>
+          <label className="label">صبيب الشبكة (L/h)</label>
+          <input className="input" type="number" value={vPumpFlow}
+                 onChange={e=>setPumpFlow(+e.target.value||0)} min={0}/>
+          <p className="muted" style={{marginTop:6}}>
+            الصبيب الإجمالي الممكن من النقّاطات: <b>{Math.round(maxNetworkLh)}</b> L/h
+          </p>
+        </div>
+        <div className="pill" style={{display:'flex',flexDirection:'column',justifyContent:'center'}}>
+          <div style={{display:'flex',alignItems:'center',gap:6}}>
+            <AlertTriangle size={16}/> <b>معلومة</b>
           </div>
+          <p className="muted" style={{margin:0}}>إذا كان صبيب الشبكة أقل بكثير من {Math.round(maxNetworkLh)} L/h، الوقت غادي يطول.</p>
+        </div>
+      </div>
 
-          <div className="pill" style={{ marginTop: 10, background: '#ecfdf5', borderColor: '#bbf7d0' }}>
-            <p>💡 {lang==='fr' ? 'Astuce' : lang==='en' ? 'Tip' : 'نصيحة'}: {advice.tip}</p>
+      {/* التوصية */}
+      <div className="card section" style={{background:'#f8fffb'}}>
+        <h4 style={{marginTop:0}}>{advice.decision.title}</h4>
+        <p className="muted" style={{marginTop:4}}>{advice.decision.reason}</p>
+
+        <div className="grid3">
+          <div className="pill">
+            <p className="muted" style={{margin:0}}>الكمية المقترحة اليوم</p>
+            <p style={{fontSize:28, fontWeight:700, margin:'6px 0 0 0'}}>{advice.liters} لتر</p>
+            <p className="muted" style={{margin:0}}>(~ {advice.perPlant} L/نبتة)</p>
           </div>
-
-          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap:'wrap' }}>
-            <button className="btn" onClick={shareWhatsApp} style={{ maxWidth: 280 }}>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                <Share2 size={16} /> 📤 {lang==='fr' ? 'Partager WhatsApp' : lang==='en' ? 'Share on WhatsApp' : 'شارك عبر واتساب'}
-              </span>
-            </button>
-            <button className="input" onClick={logCurrent} style={{cursor:'pointer'}}>
-              <span style={{ display:'inline-flex', alignItems:'center', gap:6 }}>
-                📝 {lang==='fr' ? 'Enregistrer cette opération' : lang==='en' ? 'Log this irrigation' : 'سجّل العملية'}
-              </span>
-            </button>
+          <div className="pill">
+            <p className="muted" style={{margin:0}}>مدة التشغيل</p>
+            <p style={{fontSize:28, fontWeight:700, margin:'6px 0 0 0'}}>
+              {minutes != null ? `~ ${minutes} د` : '—'}
+            </p>
+            <p className="muted" style={{margin:0}}>بصبيب الشبكة: {vPumpFlow} L/h</p>
           </div>
-
-          {/* سجل السقي */}
-          <div className="section">
-            <h4 style={{margin:'8px 0'}}>{lang==='fr' ? 'Journal des arrosages' : lang==='en' ? 'Irrigation log' : 'سجلّ السقي'}</h4>
-            {logs.length === 0 ? (
-              <p className="muted">{lang==='fr' ? 'Aucune entrée.' : lang==='en' ? 'No entries.' : 'لا توجد مدخلات.'}</p>
-            ) : (
-              <div style={{overflowX:'auto'}}>
-                <table className="input" style={{width:'100%', borderCollapse:'collapse'}}>
-                  <thead>
-                    <tr>
-                      <th style={{textAlign:'start'}}>⏱</th>
-                      <th style={{textAlign:'start'}}>{lang==='fr' ? 'Zone' : lang==='en' ? 'Zone' : 'زون'}</th>
-                      <th style={{textAlign:'start'}}>{lang==='fr' ? 'Surface' : lang==='en' ? 'Area' : 'مساحة'}</th>
-                      <th style={{textAlign:'start'}}>{lang==='fr' ? 'Litres' : lang==='en' ? 'Liters' : 'لترات'}</th>
-                      <th style={{textAlign:'start'}}>{lang==='fr' ? 'Durée' : lang==='en' ? 'Duration' : 'مدة'}</th>
-                      <th style={{textAlign:'start'}}>{lang==='fr' ? 'Lieu' : lang==='en' ? 'Place' : 'مكان'}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {logs.slice(0,5).map((x,i)=>(
-                      <tr key={i}>
-                        <td>{new Date(x.ts).toLocaleString()}</td>
-                        <td>{x.zone || '-'}</td>
-                        <td>{x.area} m²</td>
-                        <td>{x.liters} L</td>
-                        <td>~{x.minutes} {lang==='fr' ? 'min' : lang==='en' ? 'min' : 'د'}</td>
-                        <td>{x.place || '-'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            <div style={{display:'flex', gap:8, marginTop:8}}>
-              <button className="input" onClick={exportCSV} style={{cursor:'pointer'}}><Download size={14}/> CSV</button>
-              <button className="input" onClick={clearLogs} style={{cursor:'pointer'}}><Trash2 size={14}/> {lang==='fr' ? 'Vider' : lang==='en' ? 'Clear' : 'مسح'}</button>
-            </div>
+          <div className="pill">
+            <p className="muted" style={{margin:0}}>معطيات اليوم</p>
+            <p style={{margin:'6px 0 0 0'}}>حرارة: {deg(vTemp)} • شتا: {pct(vRain)} • ريح: {kmh(vWind)}</p>
           </div>
         </div>
-      )}
-    </>
+
+        <div className="pill" style={{marginTop:10, background:'#ecfdf5', borderColor:'#bbf7d0'}}>
+          <p>💡 نصيحة: {advice.tip}</p>
+        </div>
+
+        <div style={{marginTop:12, display:'flex', gap:8}}>
+          <button className="btn" onClick={addLog}><MapPin size={16}/> سجل العملية</button>
+          <a className="btn" href={shareURL} target="_blank" rel="noreferrer">
+            <span style={{display:'inline-flex',alignItems:'center',gap:8}}>
+              <Share2 size={16}/> شارك عبر WhatsApp
+            </span>
+          </a>
+        </div>
+      </div>
+    </div>
   )
 }
