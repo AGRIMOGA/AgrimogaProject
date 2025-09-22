@@ -1,0 +1,68 @@
+[
+  {
+    "id": "rasp-botrytis",
+    "crop": "framboise",
+    "name": "Botrytis (العفن الرمادي)",
+    "symptoms": ["تعفّن على الثمار", "زغب/عفن رمادي", "بقع مائية على الأزهار"],
+    "causes": ["Botrytis cinerea", "رطوبة مرتفعة", "تهوية ضعيفة"],
+    "actions": [
+      "تنقية الثمار المصابة وتحسين التهوية",
+      "سقي الصباح وتفادي البلل الطويل للأوراق",
+      "مبيد فطري مناسب عند الضرورة (مع احترام الآجال)"
+    ],
+    "images": ["/img/diseases/botrytis.jpg"],
+    "riskRules": { "tempMin": 12, "tempMax": 24, "humidityMin": 80, "rainProbMin": 50 }
+  },
+  {
+    "id": "rasp-powdery",
+    "crop": "framboise",
+    "name": "Oïdium (البياض الدقيقي)",
+    "symptoms": ["بودرة بيضاء على الأوراق/الطرود", "تشوّه الأوراق", "تباطؤ النمو"],
+    "causes": ["Erysiphe spp.", "جفاف نهاري مع رطوبة ليلية"],
+    "actions": ["إزالة الأجزاء المصابة", "تحسين التهوية", "وقاية ضد الـ Oïdium عند الحاجة"],
+    "images": ["/img/diseases/oidium.jpg"],
+    "riskRules": { "tempMin": 18, "tempMax": 28, "humidityMin": 60, "humidityMax": 85 }
+  },
+
+  {
+    "id": "straw-botrytis",
+    "crop": "fraise",
+    "name": "Botrytis (العفن الرمادي)",
+    "symptoms": ["تعفّن طري في الثمار", "قالب رمادي", "بقع على الأزهار"],
+    "causes": ["Botrytis cinerea", "بلل طويل للثمار"],
+    "actions": ["قشّ الأرضية/تغطية", "إزالة الثمار المصابة", "وقاية في الذروة"],
+    "images": ["/img/diseases/straw-botrytis.jpg"],
+    "riskRules": { "tempMin": 10, "tempMax": 22, "humidityMin": 85, "rainProbMin": 40 }
+  },
+  {
+    "id": "straw-leafspot",
+    "crop": "fraise",
+    "name": "Leaf spot (تبقّع الأوراق)",
+    "symptoms": ["بقع بنفسجية ثم وسط رمادي", "تقزّم الأوراق"],
+    "causes": ["Mycosphaerella fragariae", "أمطار متكررة"],
+    "actions": ["إزالة الأوراق القديمة", "سقي بالتنقيط", "تغذية متوازنة"],
+    "images": ["/img/diseases/straw-leafspot.jpg"],
+    "riskRules": { "tempMin": 15, "tempMax": 25, "humidityMin": 80, "rainProbMin": 30 }
+  },
+
+  {
+    "id": "avo-phytophthora",
+    "crop": "avocat",
+    "name": "تعفّن الجذور (Phytophthora)",
+    "symptoms": ["اصفرار وذبول", "تراجع نمو", "جذور بنّية متحللة"],
+    "causes": ["Phytophthora cinnamomi", "تشبّع التربة", "صرف سيّء"],
+    "actions": ["تحسين الصرف", "تقنين السقي", "معالجات تربة مرخّصة عند الحاجة"],
+    "images": ["/img/diseases/avo-rootrot.jpg"],
+    "riskRules": { "tempMin": 16, "tempMax": 28, "soilWetFlag": true }
+  },
+  {
+    "id": "avo-anthracnose",
+    "crop": "avocat",
+    "name": "Anthracnose (الأنثراكنوز)",
+    "symptoms": ["بقع داكنة على الثمار", "تعفّن حول العنق", "احتراق زهر"],
+    "causes": ["Colletotrichum gloeosporioides", "أمطار ورطوبة عالية"],
+    "actions": ["تقليم لتهوية الشجرة", "جمع الثمار المصابة", "وقاية خلال فترات المطر"],
+    "images": ["/img/diseases/avo-anthracnose.jpg"],
+    "riskRules": { "tempMin": 20, "tempMax": 30, "humidityMin": 85, "rainProbMin": 40 }
+  }
+]
