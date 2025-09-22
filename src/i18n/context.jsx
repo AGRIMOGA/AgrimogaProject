@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { DICT } from "./dict";
-import { loadJSON, saveJSON } from "@/Lib/storage";
+import { loadJSON, saveJSON } from "@/lib/storage";
 
 const LS_LANG = "agrimoga:lang";
 const I18nCtx = createContext({ lang: "ar", t: (k)=>k, setLang: ()=>{} });

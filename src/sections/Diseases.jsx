@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useEffect } from 'react'
 import { AlertTriangle, Thermometer, Droplets } from 'lucide-react'
-import { loadJSON, saveJSON } from '@/Lib/storage'
+import { loadJSON, saveJSON } from '@/lib/storage'
 import { computeRisk } from '@/Lib/risk'
 import { useI18n } from '@/i18n/context'
 import rawData from '../data/diseases.json'

@@ -7,7 +7,7 @@ import Prices from '@/sections/Prices'
 import LangSwitcher from '@/components/LangSwitcher'
 import { I18nProvider, useI18n } from '@/i18n/context'
 import { Leaf, FlaskConical, Stethoscope, ShoppingBasket, CalendarRange, Droplets } from 'lucide-react'
-import { loadJSON } from '@/Lib/storage'
+import { loadJSON } from '@/lib/storage'
 
 const LS_RISK = 'agrimoga:diseaseRisk'
 

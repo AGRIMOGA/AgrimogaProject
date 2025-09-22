@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { loadJSON, saveJSON } from "@/Lib/storage";
+import { loadJSON, saveJSON } from "@/lib/storage";
 import { useI18n } from "@/i18n/context";
 
 const LS_KEY = "agrimoga:harvest";
